@@ -1,0 +1,602 @@
+---
+title: "Case simulation (Q 1 - 6)"
+author: "Pieter Vreeburg"
+date: "March 8th, 2018"
+output: word_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(knitr.kable.NA = '') # display Na values as blanks in kable
+```
+
+```{r libs_settings, include = FALSE}
+library(knitr)
+library(readr) # for reading csv data
+library(dplyr) # for data wrangling
+library(lubridate) # dates for humans
+library(fitdistrplus) # fit distributions to dat
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(forcats)
+library(magrittr)
+```
+
+## 1. Data preparation
+```{r read_data, include = FALSE}
+# read data
+parcel <- read_csv2('parcel_processing_data.csv', skip = 1,
+    col_names =  c('eind_lossen', 'begin_checken', 'eind_checken', 'begin_admin', 'eind_admin', 'rdc'),
+    col_types = cols(eind_lossen = col_datetime(format = '%d-%m-%y %H:%M'),
+                      begin_checken = col_datetime(format = '%d-%m-%y %H:%M'),
+                      eind_checken = col_datetime(format = '%d-%m-%y %H:%M'),
+                      begin_admin = col_datetime(format = '%d-%m-%y %H:%M'),
+                      eind_admin = col_datetime(format = '%d-%m-%y %H:%M')))
+
+# clean-up parcel dataset, drop rows with incorrect values, calculate throughput and remove outliers
+# use complete dataset to calculate throughput times for q1
+# drop rows with weekend-days in admin or check columns
+drop_index <- !between(wday(parcel$begin_checken), 2, 6)
+drop_index <- drop_index + !between(wday(parcel$eind_checken), 2, 6)
+drop_index <- drop_index + !between(wday(parcel$begin_admin), 2, 6)
+drop_index <- drop_index + !between(wday(parcel$eind_admin), 2, 6)
+
+# drop rows with out_of bounds start / end times
+drop_index <- drop_index + (hour(parcel$begin_checken) < 7)
+drop_index <- drop_index + (hour(parcel$eind_checken) > 18)
+drop_index <- drop_index + (hour(parcel$begin_admin) < 7)
+drop_index <- drop_index + (hour(parcel$eind_admin) > 18)
+
+# difference tp per phase in mins
+parcel$wait_lossen <- difftime(parcel$begin_checken, parcel$eind_lossen, units = 'mins')
+parcel$tp_checken <- difftime(parcel$eind_checken, parcel$begin_checken, units = 'mins')
+parcel$wait_admin <- difftime(parcel$begin_admin, parcel$eind_checken, units = 'mins')
+parcel$tp_admin <- difftime(parcel$eind_admin, parcel$begin_admin, units = 'mins')
+parcel$tp_total <- difftime(parcel$eind_admin, parcel$eind_lossen, units = 'mins' )
+
+# drop outliers in tp_checken / tp_admin == 0 | > 660
+drop_index <- drop_index + (parcel$tp_checken == 0 | parcel$tp_checken > 660)
+drop_index <- drop_index + (parcel$tp_admin == 0 | parcel$tp_admin > 660)
+
+parcel_clean <- parcel[drop_index == 0, ]
+```
+
+When I prepared the provided data set for further analysis I spent quite some to figuring out the balance between correcting and removing incorrect data. At first I tried to clean-up incorrect data by merging overlapping intervals and shifting out-of-bound time stamps but discovered the assumptions I made to do my corrections mostly added additional noise to the data set. In the end I decided to clean-up the data set by removing observations with incorrect data. The following observations are removed from the initial data set:
+
+* Observations which's time-stamps span 2 calendar days
+* Observations which's time-stamps fall on a Saturday or Sunday
+* Observations with out-of-bound time-stamps (before 7.00 of after 18.00)
+* Observations with 0 second throughput-time
+
+After dropping all observations with incorrect data I had `r nrow(parcel_clean)` observations (out of `r nrow(parcel)`) left for further analysis.
+
+## 2. Throughput time in business days
+```{r throughput_bizdays, include = FALSE}
+# summarize throughput / waiting times
+avg_per_phase <- summarise(parcel_clean, 
+                            wait_lossen = round(mean(wait_lossen), 2),
+                            checking = round(mean(tp_checken), 2),
+                            wait_admin = round(mean(wait_admin), 2),
+                            admin = round(mean(tp_admin), 2),
+                            total = round(mean(tp_total), 2))
+
+cnt_on_time <- sum(parcel_clean$tp_total <= (48 * 60))
+prop_on_time <- round(cnt_on_time / length(parcel_clean$tp_total), 2)
+
+df_tp <- as.data.frame(t(avg_per_phase))
+row.names(df_tp) <- c('Wait lossen', 'checking', 'Wait admin', 'Admin', 'Total')
+colnames(df_tp) <- 'Avg. throughput'
+```
+
+It seems there are 2 ways to interpret the concept of *throughput time* for this question:
+
+* From the perspective of the operations manager: what is sum of the exact duration of every phase in the process added to the total 'downtime' of the package (duration of the period when the package was at the warehouse, but was not being processed)?
+* From the perspective of the customer: what is the duration of the period (measured in whole business days) when the package was at the warehouse, regardless of the phase of the process, 'downtime', etc.
+
+As this question seems to concern whether the KPI has been met I have chosen to go with interpretation 2. Table 1 lists the average throughput time in minutes for every phase in the process (from unloading to start check, from start check to finish check, etc.). 
+
+`r kable(df_tp, caption = 'Table 1: average throughput time per phase (in business days)')`
+
+Between *`r date(min(parcel_clean$eind_lossen))`* and *`r date(max(parcel_clean$eind_admin))`* a total of `r nrow(parcel_clean)` packages were processed in the warehouse. Of these packages `r cnt_on_time` (`r prop_on_time` %) were processed within 2 business days.
+
+## 3. Utilization during check and admin phases
+```{r cleanup_func, include = FALSE}
+# cleanup function for separated check and admin phases, drop rows with incorrect values, calculate throughput and remove outliers
+cleanup <- function(input_df, start_field, end_field) {
+  # drop rows which span 2 dates
+  df_clean <- input_df[as.Date(input_df[[start_field]]) == as.Date(input_df[[end_field]]), ]
+  # drop rows with weekend-days
+  df_clean <- df_clean[between(wday(df_clean[[start_field]]), 2, 6), ]
+  # drop rows with out_of bounds start times
+  df_clean <- df_clean[df_clean[[start_field]] > as_datetime(paste(as_date(df_clean[[start_field]]), '7:00:00')), ]
+  # drop rows with out_of bounds end times
+  df_clean <- df_clean[df_clean[[end_field]] < as_datetime(paste(as_date(df_clean[[end_field]]), '18:00:00')), ]
+  # difference end_field with start_field in mins
+  df_clean$tp <- as.integer(difftime(df_clean[[end_field]], df_clean[[start_field]], units = 'mins'))
+  # drop rows with 0 values after diffing
+  df_clean <- df_clean[df_clean$tp > 0, ]
+  # No need to drop other outliers (no records can have tp > 660 mins in the current setup)
+
+  return(df_clean)
+  }
+
+# separate check and admin data to retain max records
+check_clean <- cleanup(parcel[ , c(2, 3, 6)], 'begin_checken', 'eind_checken')
+admin_clean <- cleanup(parcel[ , c(4, 5, 6)], 'begin_admin', 'eind_admin')
+```
+
+For question 2 I only dropped observations with incorrect values for the variables concerned to maximize the number available observations.
+
+### Package check: worker utilization
+```{r echo = FALSE}
+check_time_worked_pd <- by(check_clean$tp, as_date(check_clean$begin_checken), sum)
+util_check <- round((check_time_worked_pd / (11 * 60)) * 100, 2)
+```
+
+After dropping all observations with incorrect values I had `r nrow(check_clean)` observations (out of `r nrow(parcel)`) left for the 'check' phase of the process. During this phase of the process the average utilization per day of the assigned worker is `r round(mean(util_check), 2)`%. The highest utilization during the observed period was `r max(util_check)`% (`r names(check_time_worked_pd)[util_check == max(util_check)]`). The lowest utilization during the observed period was `r min(util_check)`% (`r names(check_time_worked_pd)[util_check == min(util_check)]`).
+
+The utilization is calculated under the assumption that every phase in the process has a worker assigned during the 11 hours when the warehouse is open (workers are rotated in order to take breaks etc.)
+
+### Package admin: worker utilization
+```{r echo = FALSE}
+admin_time_worked_pd <- by(admin_clean$tp, as_date(admin_clean$begin_admin), sum)
+util_admin <- round((admin_time_worked_pd / (2 * 11 * 60)) * 100, 2)
+```
+
+After dropping all observations with incorrect data I had `r nrow(admin_clean)` observations (out of `r nrow(parcel)`) left for the 'admin' phase of the process. During this phase of the process the average utilization per day of the assigned worker is `r round(mean(util_admin), 2)`. The highest utilization during the observed period was `r max(util_admin)` (`r names(admin_time_worked_pd)[util_admin == max(util_admin)]`). The lowest utilization during the observed period was `r min(util_admin)` (`r names(admin_time_worked_pd)[util_admin == min(util_admin)]`).
+
+The utilization is calculated under the assumption that every phase in the process has a worker assigned during the 11 hours when the warehouse is open (workers are rotated in order to take breaks etc.)
+
+## 4. Fit a theoretical distribution to the empirical data
+
+### Package check
+```{r distr_check, echo = FALSE}
+# plot distribution of check_clean
+plot_distr_check <- plotdist(check_clean$tp, histo = TRUE, demp = TRUE)
+```
+
+Based on a histogram / density plot of the 'check' data set I decided to fit the *Gamma*, *Weibull* and *LogNormal* distributions to the data. The distribution to use in the simulation will be based on AIC-score and the results of a Kolmogorov-Smirnov test.
+
+```{r, fit_distr_check, echo = FALSE}
+# fit possible distributions
+fit_gamma_check <- fitdist(check_clean$tp, 'gamma', lower = c(0, 0))
+fit_weibull_check <- fitdist(check_clean$tp, 'weibull', lower = c(0, 0))
+fit_lnorm_check <- fitdist(check_clean$tp, 'lnorm')
+
+# Kolmogorov-Smirnov test
+gof_stats_check <- gofstat(list(fit_gamma_check, fit_weibull_check, fit_lnorm_check))
+gof_stats_check
+gof_stats_check$kstest
+```
+
+None of the selected distributions pass the KS test. Based on the AIC-score the LogNormal distributions seems to be the best fit for the checking phase.
+
+```{r, plot_distr_check, echo = FALSE}
+# plot fitted distrib
+plot_fit_distr_check <- plot(fit_lnorm_check, demp = TRUE)
+```
+
+The Q-Q plot indicates the selected distribution has problems with the fit in the right tail of the data.
+
+### Package admin
+```{r distr_admin, echo = FALSE}
+# plot distribution of admin_clean
+plot_distr_admin <- plotdist(admin_clean$tp, histo = TRUE, demp = TRUE)
+```
+
+Based on a histogram / density plot of the 'admin' data set I decided to fit the *Gamma*, *Weibull* and *LogNormal* distributions to the data. The distribution to use in the simulation will be based on AIC-score and the results of a Kolmogorov-Smirnov test.
+
+```{r, fit_distr_admin, echo = FALSE}
+# fit possible distributions
+fit_gamma_admin <- fitdist(admin_clean$tp, 'gamma', lower = c(0, 0))
+fit_weibull_admin <- fitdist(admin_clean$tp, 'weibull', lower = c(0, 0))
+fit_lnorm_admin <- fitdist(admin_clean$tp, 'lnorm', lower = c(0, 0))
+
+# Kolmogorov-Smirnov test
+gof_stats_admin <- gofstat(list(fit_gamma_admin, fit_weibull_admin, fit_lnorm_admin))
+gof_stats_admin
+gof_stats_admin$kstest
+```
+
+None of the selected distributions pass the KS test. Based on the AIC-score the LogNormal distributions seems to be the best fit for the checking phase.
+
+```{r plot_distr_admin, echo = FALSE}
+# plot fitted distrib
+plot_fit_distr_admin <- plot(fit_lnorm_admin, demp = TRUE)
+```
+
+The Q-Q plot indicates the selected distribution has problems with the fit in the right tail of the data. 
+
+This will probably cause differences between the simulated data for questions 4a an 4b.
+
+## Warehouse simulation
+```{r sim, echo = FALSE}
+# source sim from separate file, working on the sim is easier in a stand-alone file
+source('parcel_sim_PV.R')
+
+# determine emergency packages (end_checken current package before end checking previous package, see q5b)
+parcel_clean <- parcel_clean[order(parcel_clean$begin_checken), ]
+emergency <- as.integer(difftime(parcel_clean$eind_checken, min(parcel_clean$begin_checken), units = 'mins')) %>%
+  diff(lag = 1)
+parcel_clean$emergency <- (c(0, emergency) < 0)
+
+# 4a, run sim on real arrival times and random (lognorm) data for check and admin phases
+sim_random <- parcel_sim(parcel_clean, 
+                          max_data = NULL, 
+                          set_seed = FALSE, 
+                          reps = 1000, 
+                          use_real_tp = FALSE,
+                          replace_rdc = FALSE,
+                          process_rule = 'fifo',
+                          verbose = FALSE)
+last_sim_random <- sim_random$df_curr_rep
+
+# 4b, run sim on real arrival times and samples from the real check and admin throughput times
+sim_real <- parcel_sim(parcel_clean, 
+                          max_data = NULL, 
+                          set_seed = FALSE, 
+                          reps = 1000, 
+                          use_real_tp = TRUE, 
+                          replace_rdc = FALSE,
+                          process_rule = 'fifo',
+                          verbose = FALSE)
+last_sim_real <- sim_real$df_curr_rep
+```
+
+Initially I had some difficulties when trying to add the 2nd parallel admin worker. It turned out I was on the right track, but was unable to finish in time for the question 4a deadline. To help my understanding I took a step back (and made sure I got some sleep beforehand) and rewrote the entire simulation using more explicit variable names. I also wrapped the simulation in a function to separate the sim namespace from the global namespace and in order to easily configure options like the number of reps, more verbose output, etc. Through this exercise my understanding of the simulation code improved and I was able to add the 2nd parallel admin worker (incl. code to correctly register departure times) and some assorted necessities / niceties in order to answer questions 4a and 4b.
+
+A disadvantage of this exercise was that I ended up with simulation code which is different from the simulation code provided with the course. When I encounter a problem in my code or need to add a feature I have to come up with a solution myself as copying directly from the provided code has become impossible.
+
+As my results for question 4a are similar to the posted results I have confidence my rewritten simulation code is working correctly. 
+
+### 4a
+Using real arrival times (measured in the number of minutes passed since the earliest arrival) and random checking and admin throughput times (drawn from LogNormal distributions) I arrived at the following numbers for the mean and the standard deviation of the total throughput time, and the percentage of packages shipped on time (`r length(sim_random$mean_tp)` repetitions).
+
+* Mean throughput time: `r round(mean(sim_random$mean_tp), 2)`
+* (Average) Standard deviation throughput time: `r round(mean(sim_random$sd_tp), 2)`
+* (Average) Number of packages shipped within 2 business days (48 hrs): `r round(mean(sim_random$prop_on_time), 2)` %
+
+### 4b
+Using real arrival times and random samples from the real checking and admin throughput times (to which I added a tiny bit of random noise to avoid timeline collisions) I arrived at the following numbers for the mean and the standard deviation of the total throughput time, and the percentage of packages shipped on time (`r length(sim_real$mean_tp)` repetitions).
+
+* Mean throughput time: `r round(mean(sim_real$mean_tp), 2)`
+* (Average) Standard deviation throughput time: `r round(mean(sim_real$sd_tp), 2)`
+* (Average) Number of packages shipped within 2 business days (48 hrs): `r round(mean(sim_real$prop_on_time), 2)` %
+
+### 5) What if simulations
+For questions 5 a-d I have adapted the 4a-b version of the simulation to work with vector-based queues instead of counter-based queues. The ids of incoming packages are directly stored in the checking and admin queue's. Processing-rules (fifo, fifo with emergencies, lifo) can then be implemented by manipulating the various queue's (for example: add emergency packages to the front of the queue instead of the end). The package ids are used to register the correct arrival and departure times of the various packages.
+
+A theoretical disadvantage of this approach is that it involves a lot of growing and shrinking of vectors. We have been taught that this can lead to performance problems when working with R. As the vectors involved are relatively short (in my case max `r nrow(parcel_clean)` positions and in practice always much shorter) the performance hit (if any) turned out to be negligible.
+
+For questions 5 a-d I have used the real arrival rates as input data for the simulation and sampled from the historical throughput times for the checking and admin phases.
+
+#### a) Compare simulation results with observed results
+
+##### Total throughput time
+```{r compare_sim_obs, include = FALSE}
+observed_mean_tp <- mean(as.integer(parcel_clean$tp_total))
+
+# check t-test assumptions (normality)
+norm_test <- shapiro.test(sim_real$mean_tp)
+hist(sim_real$mean_tp)
+
+# not normal, therefore use wilcox.test
+test_obs_sim <- wilcox.test(sim_real$mean_tp, mu = observed_mean_tp)
+```
+
+Given the difference between the simulation (packages are handled immediately as they become available and a worker is available) and the real data (many packages spend multiple days waiting for the checking and admin phases) a comparison between the simulated and the observed data reveals a huge difference in average throughput times. 
+
+* Average observed throughput time: `r round(observed_mean_tp, 2)`
+* Average simulated throughput time: `r round(mean(sim_real$mean_tp), 2)` (`r length(sim_real$mean_tp)` repetitions)
+
+A Wilcoxon signed rank test (while not really necessary in this case) provides proof (H~0~: average simulated throughput time is equal to the observed throughput time, H~a~: average simulated throughput time is not equal to the observed throughput time, p.value: `r round(test_obs_sim$p.value, 2)`, therefore H~0~ will be rejected and H~a~ will be accepted).
+
+Note: I used a Wilcoxon signed rank test as the non-normality of the simulation output (Shapiro-Wilk normality test p-value: `r round(norm_test$p.value, 2)`) precluded the use of a t-test.
+
+```{r compare_sim_obs_details, include = FALSE}
+observed_mean_tp_checken <- mean(as.integer(parcel_clean$tp_checken))
+observed_mean_tp_admin <- mean(as.integer(parcel_clean$tp_admin))
+
+# check t-test assumptions (normality)
+shapiro.test(sim_real$mean_tp_checken)
+hist(sim_real$mean_tp_checken)
+shapiro.test(sim_real$mean_tp_admin)
+hist(sim_real$mean_tp_admin)
+
+# not normal, therefore use wilcox.test
+mean(sim_real$mean_tp_checken)
+mean(sim_real$mean_tp_admin)
+wilcox.test(sim_real$mean_tp_checken, mu = observed_mean_tp_checken)
+wilcox.test(sim_real$mean_tp_admin, mu = observed_mean_tp_admin)
+```
+
+##### Checking and admin throughput times
+
+Interestingly enough there is a large difference between the simulated and observed throughput times for the checking phase. This seems to be caused by the different starting points used to calculate throughput time. For the observed data this is the 'start checken' variable, for the simulated data this is the time when the package enters the simulation. The time the package spends waiting in the simulated checking queue is included in the throughput time for the simulated checking phase. The same effect is, while less pronounced due to the 2 available admin workers, also observed for the simulated admin phase.
+
+It could be interesting to add some tracking variables (time start check, time start admin 1 & 2) in a future rewrite of the simulation to separate processing and waiting times and obtain more accurate throughput times for each process phase. This would also make it possible to calculate the utilization of the workers during the simulated days (which is not possible in the current setup).
+
+* Average observed throughput time checking: `r round(observed_mean_tp_checken, 2)`
+* Average simulated throughput time checking: `r round(mean(sim_real$mean_tp_checken), 2)` (`r length(sim_real$mean_tp_checken)` repetitions)
+
+* Average observed average throughput time admin: `r round(observed_mean_tp_admin, 2)`
+* Average simulated throughput time admin: `r round(mean(sim_real$mean_tp_admin), 2)` (`r length(sim_real$mean_tp_admin)` repetitions)
+
+Note: observed differences are again validated with a Wilcoxon signed rank test.
+
+#### b) Effect of emergency jobs?
+```{r emergencies, include = FALSE}
+# 5b, run sim on real arrival times and samples from the real check and admin throughput times
+# process_rule = 'fifo_emergency'
+sim_real_emerg <- parcel_sim(parcel_clean, 
+                                max_data = NULL, 
+                                set_seed = FALSE, 
+                                reps = 1000, 
+                                use_real_tp = TRUE, 
+                                replace_rdc = FALSE,
+                                process_rule = 'fifo_emergency',
+                                verbose = FALSE)
+last_sim_real_emerg <- sim_real_emerg$df_curr_rep
+
+# check t-test assumptions (normality)
+shapiro.test(sim_real_emerg$mean_tp_normal)
+hist(sim_real_emerg$mean_tp_normal)
+shapiro.test(sim_real_emerg$mean_tp_emerg)
+hist(sim_real_emerg$mean_tp_emerg)
+
+# not normal, therefore use wilcox.test
+# mean tp
+mean(sim_real$mean_tp)
+mean(sim_real_emerg$mean_tp)
+wilcox.test(sim_real$mean_tp, sim_real_emerg$mean_tp)
+
+# mean tp emerg vs normal packages
+mean(sim_real_emerg$mean_tp_normal)
+mean(sim_real_emerg$mean_tp_emerg)
+wilcox.test(sim_real_emerg$mean_tp_normal, sim_real_emerg$mean_tp_emerg)
+
+# mean tp sim_real vs sim_real_emerg$tp_normal
+mean(sim_real$mean_tp)
+mean(sim_real_emerg$mean_tp_normal)
+wilcox.test(sim_real$mean_tp, sim_real_emerg$mean_tp_normal)
+```
+
+With the rewritten queuing logic in place it was a two step process to add emergency packages to the simulation. Step 1 was to identify the emergency packages in the source data. For this I used the suggestion made on Blackboard to mark packages in the source data which are checked before the check of the previous package is done as an emergency package (`r nrow(parcel_clean[parcel_clean$emergency == 1, ])` packages). Step 2 was to feed both the emergency variable and the arrival time variable from the source data into the simulation. When an emergency package is fed into one of the simulation's queues the default fifo processing rule for the queue is changed to lifo for this package only. After the queue update for this package the queue's processing rule is reset to fifo. A disadvantage of this approach is that the emergency packages always arrive in the same order in every iteration of the simulation. In a future rewrite of the simulation I would probably generate emergency packages randomly to add more variation to the simulated results.
+
+Adding a priority rule for emergency packages has no effect on the average throughput time for all packages between the regular fifo-based and fifo-with-emergency based simulations. This is not unexpected given the zero-sum game in play in the simulation: where some packages get pushed ahead of the other packages and other packages have to wait proportionally longer for processing.
+
+The priority rule does have a strong effect however on the average throughput times of the emergency vs the non-emergency (normal) packages:
+
+* Average simulated throughput time (normal packages): `r round(mean(sim_real_emerg$mean_tp_normal), 2)` (`r length(sim_real$mean_tp_normal)` repetitions)
+* Average simulated throughput time (emergency packages): `r round(mean(sim_real_emerg$mean_tp_emerg), 2)` (`r length(sim_real_emerg$mean_tp_emerg)` repetitions)
+
+The effect of the priority rule on the average processing time of the non-emergency packages is rather limited:
+
+* Average simulated throughput time (normal packages): `r round(mean(sim_real$mean_tp), 2)` (`r length(sim_real$mean_tp)` repetitions)
+* Average simulated throughput time (normal packages, sim with priority rule for emergency packages): `r round(mean(sim_real_emerg$mean_tp_normal), 2)` (`r length(sim_real_emerg$mean_tp_emerg)` repetitions)
+
+Using fifo-based queuing rules with an added priority rule for emergency-packages seems to add business value. Emergency packages are handled much quicker, while the delay incurred by normal packages is rather limited. 
+
+Note: observed differences are again validated with a Wilcoxon rank sum test (from here on I decided to continue using the Wilcoxon signed rank or Wilcoxon rank sum test to test for differences in the simulation output).
+
+#### c) Higher workload RDC jobs?
+```{r test tp_diffs, include = FALSE}
+# 5c, run sim on real arrival times and samples from the real check and admin throughput times (replace RDC tps with average tps)
+sim_real_nordc <- parcel_sim(parcel_clean,
+                              max_data = NULL, 
+                              set_seed = FALSE, 
+                              reps = 1000, 
+                              use_real_tp = TRUE, 
+                              replace_rdc = TRUE,
+                              process_rule = 'fifo',
+                              verbose = FALSE)
+last_sim_real_nordc <- sim_real_nordc$df_curr_rep
+
+# tp observed rdc vs nordc
+total_rdc <- sum(parcel_clean$rdc == 'YES')
+tp_rdc_checken <- mean(as.integer(parcel_clean$tp_checken[parcel_clean$rdc == 'YES']))
+tp_nordc_checken <- mean(as.integer(parcel_clean$tp_checken[parcel_clean$rdc == 'NO']))
+tp_rdc_admin <- mean(as.integer(parcel_clean$tp_admin[parcel_clean$rdc == 'YES']))
+tp_nordc_admin <- mean(as.integer(parcel_clean$tp_admin[parcel_clean$rdc == 'NO']))
+
+# tp
+mean(sim_real$mean_tp)
+mean(sim_real_nordc$mean_tp)
+wilcox.test(sim_real$mean_tp, sim_real_nordc$mean_tp)
+```
+
+For this question I replaced the observed throughput times of the RDC packages with the observed average throughput times of the non-RDC packages. To keep the sampling fair I added as many new values as I removed from the sample space.
+
+When comparing the regular simulation results and the non-RDC simulation results there is a small difference in average throughput times. This is probably too small to merit the implementation of a special procedure for RDC packages.
+
+* Average simulated throughput time (throughput times of RDC packages included): `r round(mean(sim_real$mean_tp), 2)`
+* Average simulated throughput time (throughput times of RDC packages replaced): `r round(mean(sim_real_nordc$mean_tp), 2)`
+
+The minor effect of replacing RDC throughput times is probably caused by the relatively low number of RDC packages in the data (`r total_rdc` of `r nrow(parcel_clean)`) and the small differences in average observed throughput times (checken: `r round(tp_rdc_checken, 2)` (RDC) vs `r round(tp_nordc_checken, 2)` (no RDC), admin: `r round(tp_rdc_admin, 2)` (RDC) vs `r round(tp_nordc_admin, 2)` (no RDC)).
+
+#### d) Effect of priority rules?
+
+##### LIFO
+```{r lifo_rule, include = FALSE}
+# 5d_1, run sim on real arrival times and samples from the real check and admin throughput times
+# process_rule = 'lifo'
+sim_real_lifo <- parcel_sim(parcel_clean,
+                              max_data = NULL, 
+                              set_seed = FALSE, 
+                              reps = 1000, 
+                              use_real_tp = TRUE, 
+                              replace_rdc = FALSE,
+                              process_rule = 'lifo',
+                              verbose = FALSE)
+last_sim_real_lifo <- sim_real_lifo$df_curr_rep
+
+mean(sim_real$mean_tp)
+mean(sim_real_lifo$mean_tp)
+wilcox.test(sim_real$mean_tp, sim_real_lifo$mean_tp)
+
+mean(sim_real$sd_tp)
+mean(sim_real_lifo$sd_tp)
+wilcox.test(sim_real$sd_tp, sim_real_lifo$sd_tp)
+```
+
+To implement a lifo rule in the simulation I added a queue processing rule which appends new packages at the start, instead of the end, of the checking and admin queues. Like the other options added for q5 this option can be turned on by passing the correct parameters to the simulation function call (note that when the lifo rule is active emergency packages are processed like regular packages).
+
+There is no discernible difference in average throughput time between the lifo- and fifo-based simulations. 
+
+There is however a larger spread in the reported throughput time for the individual packages in the lifo-based simulation. This is not unexpected as, in this version of the simulation, some packages spend very little time waiting in the checking and admin queues, while other packages get continuously pushed back to the end of the queue.
+
+* Average simulated throughput time standard deviation (fifo): `r round(mean(sim_real$sd_tp), 2)` (`r length(sim_real$sd_tp)` repetitions)
+* Average simulated throughput time standard deviation (lifo): `r round(mean(sim_real_lifo$sd_tp), 2)` (`r length(sim_real_lifo$sd_tp)` repetitions)
+
+Using lifo-based instead of fifo-based queuing rules seems to add no value to the business process (it may actually incur additional costs to the business as a lifo-based queuing rule could be more difficult to implement in practice due to additional physical movement of packages, etc.).
+
+Note: observed differences are again validated with a Wilcoxon rank sum test.
+
+##### Flexible admin worker
+```{r flex_admin_2, include = FALSE}
+# 5d_2, run sim on real arrival times and samples from the real check and admin throughput times
+# use sim variant with flexible admin 2 worker
+source('parcel_sim_PV_flex_admin.R')
+
+sim_real_flex <- parcel_sim_flex(parcel_clean,
+                                  max_data = NULL, 
+                                  set_seed = FALSE, 
+                                  reps = 1000, 
+                                  use_real_tp = TRUE, 
+                                  replace_rdc = FALSE,
+                                  process_rule = 'fifo',
+                                  verbose = FALSE)
+last_sim_real_flex <- sim_real_flex$df_curr_rep
+
+# tp
+mean(sim_real$mean_tp)
+mean(sim_real_flex$mean_tp)
+wilcox.test(sim_real$mean_tp, sim_real_flex$mean_tp)
+
+# tp checking
+mean(sim_real$mean_tp_checken)
+mean(sim_real_flex$mean_tp_checken)
+wilcox.test(sim_real$mean_tp_checken, sim_real_flex$mean_tp_checken)
+
+# tp admin
+mean(sim_real$mean_tp_admin)
+mean(sim_real_flex$mean_tp_admin)
+wilcox.test(sim_real$mean_tp_admin, sim_real_flex$mean_tp_admin)
+```
+
+For the second part of question 5d I decided to add some additional flexibility to the simulation instead of more queuing options. In this version of the simulation the second admin worker has an 'alternative' mode in which he / she starts helping the checking worker when there are more than 3 packages in the checking queue (I played around a bit with the cut-off point and > 3 seems to be the sweet spot). I thought this would be useful as the packages tend to arrive in large batches creating a temporary bottleneck in the checking queue. The alternative mode is sticky, when the second admin worker starts working on the checking queue he / she keeps working on the checking queue until the number of packages in the queue drops below to 3 or lower. The worker then returns (after finishing the current package) to work on the admin queue.
+
+This first implementation of the flex-worker mechanism is rather simple. If I had more time available I would implement a more sophisticated switching system, in the current implementation the second admin worker only starts considering the checking queue after he / she has finished the first admin task of the day, leading to a delayed start of the alternative mode. I would also more thoroughly investigate the optimal start / stop conditions of the alternative mode.
+
+However, regardless of the simplicity of the current implementation, the addition of a flex-worker seems to add some extra business value. The average throughput time of the packages in a fifo-based simulation with a flex-worker is a little bit lower than the throughput time in the regular fifo-based simulation with fixed workers.
+
+* Average simulated throughput time fixed worker: `r round(mean(sim_real$mean_tp), 2)` (`r length(sim_real$mean_tp)` repetitions)
+* Average simulated throughput time flex worker: `r round(mean(sim_real_flex$mean_tp), 2)` (`r length(sim_real_flex$mean_tp)` repetitions)
+
+An optimized flex-worker mechanism could very well yield even better results, to be fair however it would also be necessary to model some time lost due to job switching (walk to the other end of the hall to the other queue, etc.)
+
+Note: observed differences are again validated with a Wilcoxon rank sum test.
+
+#### Sensitivity analysis
+
+##### One at a time
+```{r sens_one, echo = FALSE}
+incr_check <- seq(1,2,0.05)
+incr_mean_tp <- double()
+incr_avg_l_q_check <- double()
+incr_avg_l_q_admin <- double()
+list_wilcox <- vector('list', length(incr_check))
+i <- 1
+for (incr_i in seq(1, length(incr_check))) {
+  sim_sensitivity <- parcel_sim(parcel_clean,
+                              max_data = NULL, 
+                              set_seed = FALSE, 
+                              reps = 500, 
+                              use_real_tp = FALSE,
+                              random_check_multiplier = incr_check[incr_i],
+                              random_admin_multiplier = 1,
+                              replace_rdc = FALSE,
+                              process_rule = 'fifo',
+                              verbose = FALSE)  
+  incr_mean_tp <- c(incr_mean_tp, mean(sim_sensitivity$mean_tp))
+  incr_avg_l_q_check <- c(incr_avg_l_q_check, mean(sim_sensitivity$avg_l_q_checken))
+  incr_avg_l_q_admin <- c(incr_avg_l_q_admin, mean(sim_sensitivity$avg_l_q_admin))
+  list_wilcox[[i]] <- sim_sensitivity$mean_tp
+  i <- i + 1
+}
+
+df_plot <- data_frame(incr_check, incr_mean_tp, incr_avg_l_q_check, incr_avg_l_q_admin)
+colnames(df_plot) <- c('multiplier', 'average tp', 'average q check', 'average q admin')
+df_plot <- gather(df_plot, key, value, 2:4)
+df_plot$key %<>% as_factor()
+sens_plot_1a <- ggplot(filter(df_plot, key == 'average tp'), aes(multiplier, value)) + geom_line(size = 1) + 
+  theme_bw() + labs(title = 'Fig. 1: average throughput time (check)')
+sens_plot_1b <- ggplot(filter(df_plot, key != 'average tp'), aes(multiplier, value, color = key)) + geom_line(size = 1) + 
+  theme_bw() + labs(title = 'Fig. 2: average queue lengths (check)')
+
+wilcox_p_vals <- round(map_dbl(seq(2, length(list_wilcox)), function(x) {wilcox.test(list_wilcox[[1]],
+                                                                              list_wilcox[[x]])$p.value}),3)
+```
+
+For this question I investigated the effect of a) incremental increases in the logmean parameter of the check random number generator and b) incremental increases in the logmean parameters of both the check- and admin random number generators on the average simulated throughput time and the average simulated queue lengths. This could for example be caused by the acquisition of a new client which's packages require more time to check and/or the introduction of more red tape which requires more time for the administrative procedures.
+
+To make this work in the simulation I added additional reporting functionality (average queue lengths using the delta weighted queue length approach demonstrated in the lecture slides) and new function parameters (multipliers which can increase or decrease the parameters of the distribution functions by a certain percentage) to the simulation code. For each multiplier parameter provided to the simulation 500 repetitions are performed using the full dataset. The average throughput time and average queue lengths for all repetitions done with this multiplier parameter are collected for plotting. The average throughput times for each separate repetition are also collected. Wilcoxon rank sum tests are then used on the resulting list of vectors to the compare the repetitions done for the baseline multiplier (1) to the repetitions done for the subsequent multipliers (1,05, 1,1, 1,5, etc.).
+
+Figure 1 below displays the effect of a 100% increase (in 5% steps) of the logmean parameter for the check random number generator on the simulated average throughput time. A series of Wilcoxon rank sum tests proves the plotted average for each multiplier parameter is derived from a separate distribution. Figure 2 displays the effect of the same operation on the simulated queue lengths. 
+```{r, echo = FALSE}
+sens_plot_1a
+sens_plot_1b
+```
+
+Figure 1 demonstrates the simulated throughput time is quite sensitive to changes in the logmean parameter of the check random number generator. The average throughput time exponentially grows when the multiplier is increased, rising more sharply after (plusminus) 1.75. Figure 2 demonstrates that as the time needed for the check phase grows, the average length of the check queue also increases exponentially (which is of couse not very surprising). The average length of the admin queue is not affected, which is also not surprising given that hte bottleneck occors in the check phase.
+
+##### Two at a time
+```{r sens_two, echo = FALSE}
+incr_check <- seq(1,2,0.05)
+incr_admin <- seq(1,2,0.05)
+incr_mean_tp <- double()
+incr_avg_l_q_check <- double()
+incr_avg_l_q_admin <- double()
+list_wilcox <- vector('list', length(incr_check))
+i <- 1
+for (incr_i in seq(1, length(incr_check))) {
+  sim_sensitivity <- parcel_sim(parcel_clean,
+                              max_data = NULL, 
+                              set_seed = FALSE, 
+                              reps = 500, 
+                              use_real_tp = FALSE,
+                              random_check_multiplier = incr_check[incr_i],
+                              random_admin_multiplier = incr_admin[incr_i],
+                              replace_rdc = FALSE,
+                              process_rule = 'fifo',
+                              verbose = FALSE)  
+  incr_mean_tp <- c(incr_mean_tp, mean(sim_sensitivity$mean_tp))
+  incr_avg_l_q_check <- c(incr_avg_l_q_check, mean(sim_sensitivity$avg_l_q_check))
+  incr_avg_l_q_admin <- c(incr_avg_l_q_admin, mean(sim_sensitivity$avg_l_q_admin))
+  list_wilcox[[i]] <- sim_sensitivity$mean_tp
+  i <- i + 1
+}
+
+df_plot <- data_frame(incr_check, incr_mean_tp, incr_avg_l_q_check, incr_avg_l_q_admin)
+colnames(df_plot) <- c('multiplier', 'average tp', 'average q check', 'average q admin')
+df_plot <- gather(df_plot, key, value, 2:4)
+df_plot$key %<>% as_factor()
+sens_plot_2a <- ggplot(filter(df_plot, key == 'average tp'), aes(multiplier, value)) + geom_line(size = 1) + 
+  theme_bw() + labs(title = 'Fig. 3: average throughput time (check & admin)')
+sens_plot_2b <- ggplot(filter(df_plot, key != 'average tp'), aes(multiplier, value, color = key)) + geom_line(size = 1) + 
+  theme_bw() + labs(title = 'Fig. 4: average queue lengths (check & admin)')
+
+wilcox_p_vals <- round(map_dbl(seq(2, length(list_wilcox)), function(x) {wilcox.test(list_wilcox[[1]],
+                                                                              list_wilcox[[x]])$p.value}),3)
+```
+
+Figure 3 below displays the effect of a 100% increase (in 5% steps) of the logmean parameter for both the check and admin random number generator on the simulated average throughput time. A series of Wilcoxon rank sum tests proves the plotted average for each multiplier parameter is derived from a separate distribution. Figure 4 displays the effect of the same operation on the simulated queue lengths. 
+
+```{r sens_plot, echo = FALSE}
+sens_plot_2a
+sens_plot_2b
+```
+
+Figure 3 demonstrates the same pattern as figure 1 (note the additional throughput time vis-a-vis figure 1 due to the added workload in the admin phase). Figure 4 demonstrates the average length of the admin queue is less sensitive to changes than the length of the check queue. The impact of longer admin times is smoothed by the fact that there are always two admin workers available.
+The flex-worker mechanism introduced for question 5d could probably help in these cases to bring the total throughput times down.
